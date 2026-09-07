@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,10 @@ from anchor.extractors.text import TextExtractor
 from tests.unit_harness import FakeMemoryStore, deterministic_embedding
 
 _FIXTURES = Path(__file__).parent.parent / "fixtures" / "ingestion"
+
+
+class MissingDocumentMetadata(KeyError):
+    """Only a named extractor field is absent from a valid stored chunk."""
 
 
 def _offline_model(_messages: list[dict]) -> str:
@@ -32,8 +37,27 @@ def _run_ingest(filename: str) -> tuple[list[str], Path, FakeMemoryStore]:
 
 def _assert_document_metadata(metadata: dict, expected: dict[str, str | int]) -> None:
     for key, value in expected.items():
-        assert key in metadata, f"missing metadata field: {key}"
-        assert metadata[key] == value
+        if key in metadata:
+            assert metadata[key] == value
+    for key in expected:
+        if key not in metadata:
+            raise MissingDocumentMetadata(key)
+
+
+def _assert_common_chunk(chunk: dict, filepath: Path) -> dict:
+    assert isinstance(chunk, dict)
+    assert isinstance(chunk.get("content"), str)
+    assert chunk["content"]
+    metadata = chunk.get("metadata")
+    assert isinstance(metadata, dict)
+    assert metadata.get("source") == str(filepath)
+    assert metadata.get("questions") == "What is Anchor about?"
+    timestamp = metadata.get("timestamp")
+    assert isinstance(timestamp, str)
+    parsed = datetime.fromisoformat(timestamp)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() is not None
+    return metadata
 
 
 @pytest.mark.unit
@@ -43,6 +67,8 @@ def test_fixture_extractors_emit_the_pipeline_metadata_contract() -> None:
     assert text.source_format == "text"
     assert text.metadata["char_start"] == 0
     assert text.metadata["char_end"] == len(text.content)
+    assert text.metadata["line_start"] == 1
+    assert text.metadata["line_end"] == len(text.content.splitlines())
 
     markdown_path = (_FIXTURES / "sample.md").resolve()
     markdown = MarkdownExtractor().extract(markdown_path)
@@ -60,9 +86,11 @@ def test_ingest_file_preserves_existing_generated_metadata(filename: str) -> Non
     for chunk_id in chunk_ids:
         chunk = store.get(chunk_id)
         assert chunk is not None
-        assert chunk["metadata"]["source"] == str(filepath)
-        assert chunk["metadata"]["questions"] == "What is Anchor about?"
-        assert chunk["metadata"]["timestamp"]
+        _assert_common_chunk(chunk, filepath)
+        if filename == "sample.txt":
+            assert chunk["content"] == filepath.read_text(encoding="utf-8")
+        else:
+            assert chunk["content"].startswith("# About Anchor")
 
     results = store.query(
         deterministic_embedding(filepath.read_text(encoding="utf-8")),
@@ -74,20 +102,23 @@ def test_ingest_file_preserves_existing_generated_metadata(filename: str) -> Non
 @pytest.mark.unit
 @pytest.mark.xfail(
     strict=True,
+    raises=MissingDocumentMetadata,
     reason="Anchor.ingest_file currently drops TextExtractor source_format before MemoryStore.add",
 )
 def test_plain_text_source_format_survives_ingestion() -> None:
-    chunk_ids, _filepath, store = _run_ingest("sample.txt")
+    chunk_ids, filepath, store = _run_ingest("sample.txt")
     assert len(chunk_ids) == 1
 
     chunk = store.get(chunk_ids[0])
     assert chunk is not None
-    _assert_document_metadata(chunk["metadata"], {"source_format": "text"})
+    metadata = _assert_common_chunk(chunk, filepath)
+    _assert_document_metadata(metadata, {"source_format": "text"})
 
 
 @pytest.mark.unit
 @pytest.mark.xfail(
     strict=True,
+    raises=MissingDocumentMetadata,
     reason="Anchor.ingest_file currently drops TextExtractor character offsets before MemoryStore.add",
 )
 def test_plain_text_character_offsets_survive_ingestion() -> None:
@@ -97,37 +128,50 @@ def test_plain_text_character_offsets_survive_ingestion() -> None:
     chunk = store.get(chunk_ids[0])
     assert chunk is not None
     content = filepath.read_text(encoding="utf-8")
+    assert chunk["content"] == content
+    metadata = _assert_common_chunk(chunk, filepath)
     _assert_document_metadata(
-        chunk["metadata"], {"char_start": 0, "char_end": len(content)}
+        metadata,
+        {
+            "char_start": 0,
+            "char_end": len(content),
+            "line_start": 1,
+            "line_end": len(content.splitlines()),
+        },
     )
 
 
 @pytest.mark.unit
 @pytest.mark.xfail(
     strict=True,
+    raises=MissingDocumentMetadata,
     reason="Anchor.ingest_file currently drops MarkdownExtractor source_format before MemoryStore.add",
 )
 def test_markdown_source_format_survives_ingestion() -> None:
-    chunk_ids, _filepath, store = _run_ingest("sample.md")
+    chunk_ids, filepath, store = _run_ingest("sample.md")
     assert len(chunk_ids) == 1
 
     chunk = store.get(chunk_ids[0])
     assert chunk is not None
-    _assert_document_metadata(chunk["metadata"], {"source_format": "markdown"})
+    metadata = _assert_common_chunk(chunk, filepath)
+    _assert_document_metadata(metadata, {"source_format": "markdown"})
 
 
 @pytest.mark.unit
 @pytest.mark.xfail(
     strict=True,
+    raises=MissingDocumentMetadata,
     reason="Anchor.ingest_file currently drops MarkdownExtractor heading metadata before MemoryStore.add",
 )
 def test_markdown_heading_survives_ingestion() -> None:
-    chunk_ids, _filepath, store = _run_ingest("sample.md")
+    chunk_ids, filepath, store = _run_ingest("sample.md")
     assert len(chunk_ids) == 1
 
     chunk = store.get(chunk_ids[0])
     assert chunk is not None
-    _assert_document_metadata(chunk["metadata"], {"heading": "# About Anchor"})
+    assert chunk["content"].startswith("# About Anchor")
+    metadata = _assert_common_chunk(chunk, filepath)
+    _assert_document_metadata(metadata, {"heading": "# About Anchor"})
 
 
 @pytest.mark.unit
@@ -139,5 +183,17 @@ def test_document_metadata_assertion_detects_dropped_extractor_fields() -> None:
         "timestamp": "2026-09-04T00:00:00+00:00",
     }
 
-    with pytest.raises(AssertionError, match="source_format"):
+    with pytest.raises(MissingDocumentMetadata, match="source_format"):
         _assert_document_metadata(dropped_metadata, {"source_format": "text"})
+
+
+@pytest.mark.unit
+def test_wrong_metadata_value_is_not_a_known_missing_field() -> None:
+    with pytest.raises(AssertionError):
+        _assert_document_metadata({"source_format": "wrong"}, {"source_format": "text"})
+
+
+@pytest.mark.unit
+def test_wrong_present_offset_is_not_hidden_by_another_missing_offset() -> None:
+    with pytest.raises(AssertionError):
+        _assert_document_metadata({"char_end": -1}, {"char_start": 0, "char_end": 42})
